@@ -1,0 +1,25 @@
+services:
+  tide-planner:
+    build: .
+    image: tide-planner:latest
+    container_name: tide-planner
+    ports:
+      - "8000:8000"
+    environment:
+      # 数据库文件位置（容器内），下方命名卷持久化
+      DB_PATH: /data/tide.db
+      HOST: 0.0.0.0
+      PORT: "8000"
+      # 空库时自动写入演示节点/航段/初始潮位修订；置 false 可得空库
+      SEED_DEMO: "true"
+    volumes:
+      - tide-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  tide-data:
