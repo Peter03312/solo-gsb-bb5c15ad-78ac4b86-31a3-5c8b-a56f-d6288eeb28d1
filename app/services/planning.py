@@ -43,6 +43,7 @@ from .berths import (
     work_fits_calendar,
 )
 from .controls import effective_travel_time, load_controls
+from .tide import load_tide_range
 
 
 @dataclass(frozen=True)
@@ -70,13 +71,12 @@ def _load_segments(conn) -> dict[int, Segment]:
 
 
 def _load_tide(conn, revision: int, lo: int, hi: int) -> dict[int, tuple[float, float]]:
-    """返回修订 revision 在 [lo, hi] 闭区间内的 {minute: (level, error)}。"""
-    rows = conn.execute(
-        "SELECT minute, level, error FROM tide_values"
-        " WHERE revision = ? AND minute BETWEEN ? AND ?",
-        (revision, lo, hi),
-    ).fetchall()
-    return {r["minute"]: (r["level"], r["error"]) for r in rows}
+    """返回修订 revision 在 [lo, hi] 闭区间内的 {minute: (level, error)}。
+
+    差量链式存储下沿基础修订链还原（见 services/tide.py），与旧全量复制
+    的读取语义逐分钟等价；同一修订号永远还原出同一份数据。
+    """
+    return load_tide_range(conn, revision, lo, hi)
 
 
 def _minute_ok(seg: Segment, tide: float, error: float,

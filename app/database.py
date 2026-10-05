@@ -25,17 +25,34 @@ CREATE TABLE IF NOT EXISTS segments (
     CHECK (origin <> destination)
 );
 
+-- 潮位修订：base_revision 为 NULL 表示**物化修订**（全部逐分钟数据在
+-- tide_values）；非空表示**差量修订**（相对基础修订的变化分钟在 tide_deltas，
+-- 未改分钟沿基础链继承）。旧库升级时既有修订一律补为 NULL（物化），历史值
+-- 原样保留在 tide_values。
 CREATE TABLE IF NOT EXISTS tide_revisions (
     revision   INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    note       TEXT
+    note       TEXT,
+    base_revision INTEGER REFERENCES tide_revisions(revision)
 );
 
+-- 物化修订的逐分钟全量数据（名义潮位 + 预测误差）。
 CREATE TABLE IF NOT EXISTS tide_values (
     revision INTEGER NOT NULL REFERENCES tide_revisions(revision),
     minute   INTEGER NOT NULL,
     level    REAL NOT NULL,                             -- 名义潮位（米）
     error    REAL NOT NULL DEFAULT 0.0,                 -- 预测误差（米，非负）：真值落在 level±error
+    PRIMARY KEY (revision, minute)
+);
+
+-- 差量修订的逐分钟变更：每行保存该分钟在**本修订下的最终** (level, error)。
+-- 每次修订的持久化写入量只随本次改动分钟数增长，不再复制基础修订的全部分钟；
+-- 任意历史修订沿基础链还原（物化根打底、差量自老到新逐层覆盖）。
+CREATE TABLE IF NOT EXISTS tide_deltas (
+    revision INTEGER NOT NULL REFERENCES tide_revisions(revision),
+    minute   INTEGER NOT NULL,
+    level    REAL NOT NULL,                             -- 本修订下该分钟的名义潮位（米）
+    error    REAL NOT NULL DEFAULT 0.0,                 -- 本修订下该分钟的预测误差（米，非负）
     PRIMARY KEY (revision, minute)
 );
 
@@ -239,27 +256,45 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """旧版数据库平滑升级：为 tide_values 补 error 列（既有行误差取 0）；
-    为 confirmed_trips 补 ship_no / ship_version 档案引用列（既有行程为 NULL，
-    表示直接提交参数确认、无档案引用）与 berth_id / work_minutes /
-    work_start_minute / work_end_minute 泊位作业快照列（既有行程为 NULL，
-    表示未指定泊位的旧确认，其请求与响应保持原样）。"""
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(tide_values)").fetchall()}
-    if "error" not in cols:
-        conn.execute("ALTER TABLE tide_values ADD COLUMN error REAL NOT NULL DEFAULT 0.0")
+    """旧版数据库平滑升级（全部 ALTER 在单个事务内完成：升级中断则整体
+    回滚，重启后重跑本函数即可，不会留下半迁移状态；各步幂等可重入）：
+
+    - 为 tide_values 补 error 列（既有行误差取 0）；
+    - 为 tide_revisions 补 base_revision 列（既有修订为 NULL，即物化修订，
+      历史逐分钟数据继续由 tide_values 原样提供；此后新修订按差量链式存储，
+      见 services/tide.py；tide_deltas 表随上方 SCHEMA 幂等创建）；
+    - 为 confirmed_trips 补 ship_no / ship_version 档案引用列（既有行程为
+      NULL，表示直接提交参数确认、无档案引用）与 berth_id / work_minutes /
+      work_start_minute / work_end_minute 泊位作业快照列（既有行程为 NULL，
+      表示未指定泊位的旧确认，其请求与响应保持原样）。"""
+    tide_cols = {r["name"] for r in conn.execute("PRAGMA table_info(tide_values)").fetchall()}
+    rev_cols = {r["name"] for r in conn.execute("PRAGMA table_info(tide_revisions)").fetchall()}
     trip_cols = {r["name"] for r in conn.execute("PRAGMA table_info(confirmed_trips)").fetchall()}
-    if "ship_no" not in trip_cols:
-        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN ship_no TEXT")
-    if "ship_version" not in trip_cols:
-        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN ship_version INTEGER")
-    if "berth_id" not in trip_cols:
-        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN berth_id TEXT")
-    if "work_minutes" not in trip_cols:
-        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN work_minutes INTEGER")
-    if "work_start_minute" not in trip_cols:
-        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN work_start_minute INTEGER")
-    if "work_end_minute" not in trip_cols:
-        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN work_end_minute INTEGER")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if "error" not in tide_cols:
+            conn.execute("ALTER TABLE tide_values ADD COLUMN error REAL NOT NULL DEFAULT 0.0")
+        if "base_revision" not in rev_cols:
+            conn.execute(
+                "ALTER TABLE tide_revisions"
+                " ADD COLUMN base_revision INTEGER REFERENCES tide_revisions(revision)"
+            )
+        if "ship_no" not in trip_cols:
+            conn.execute("ALTER TABLE confirmed_trips ADD COLUMN ship_no TEXT")
+        if "ship_version" not in trip_cols:
+            conn.execute("ALTER TABLE confirmed_trips ADD COLUMN ship_version INTEGER")
+        if "berth_id" not in trip_cols:
+            conn.execute("ALTER TABLE confirmed_trips ADD COLUMN berth_id TEXT")
+        if "work_minutes" not in trip_cols:
+            conn.execute("ALTER TABLE confirmed_trips ADD COLUMN work_minutes INTEGER")
+        if "work_start_minute" not in trip_cols:
+            conn.execute("ALTER TABLE confirmed_trips ADD COLUMN work_start_minute INTEGER")
+        if "work_end_minute" not in trip_cols:
+            conn.execute("ALTER TABLE confirmed_trips ADD COLUMN work_end_minute INTEGER")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 # ---------------------------------------------------------------------------

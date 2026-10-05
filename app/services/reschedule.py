@@ -42,6 +42,7 @@ from .planning import (
     _load_segments,
     load_occupancy,
 )
+from .tide import load_tide_range
 
 
 def review_and_reschedule(
@@ -173,13 +174,9 @@ def _load_review_context(conn, trip_id: int, revision: Optional[int]) -> dict:
         raise ApiError(404, "TIDE_REVISION_NOT_FOUND",
                        f"潮位修订不存在: {revision}", {"revision": revision})
 
-    # 3) 全窗口潮位：任一分钟缺失即报错（与规划一致）
-    tide_rows = conn.execute(
-        "SELECT minute, level, error FROM tide_values"
-        " WHERE revision = ? AND minute BETWEEN ? AND ?",
-        (revision, start, horizon - 1),
-    ).fetchall()
-    tide = {r["minute"]: (r["level"], r["error"]) for r in tide_rows}
+    # 3) 全窗口潮位：任一分钟缺失即报错（与规划一致；差量链式存储下沿基础
+    #    修订链还原，同一修订号永远读到同一份数据）
+    tide = load_tide_range(conn, revision, start, horizon - 1)
     missing = [m for m in range(start, horizon) if m not in tide]
     if missing:
         raise tide_missing(missing)
