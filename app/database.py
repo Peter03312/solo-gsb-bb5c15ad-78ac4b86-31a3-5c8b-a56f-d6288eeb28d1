@@ -26,16 +26,36 @@ CREATE TABLE IF NOT EXISTS segments (
 );
 
 CREATE TABLE IF NOT EXISTS tide_revisions (
-    revision   INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    note       TEXT
+    revision      INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    note          TEXT,
+    base_revision INTEGER REFERENCES tide_revisions(revision),  -- 基础修订（分叉父节点）；空=基修订（全量）
+    kind          TEXT                                          -- 'root' / 'correction' / 'error'（旧行可空，视同 root）
 );
 
+-- 基修订（含旧库升级后的既有全量修订）的逐分钟全量名义潮位与误差。
+-- 自本轮起，更正/误差修订不再全量复制本表，只把本次改动分钟的**解析后**
+-- 名义潮位与误差写入 tide_deltas；读取任一修订时沿 base_revision 链还原
+-- （见 services/tides.py），故每次修订的持久化写入量只随本次改动分钟数增长。
 CREATE TABLE IF NOT EXISTS tide_values (
     revision INTEGER NOT NULL REFERENCES tide_revisions(revision),
     minute   INTEGER NOT NULL,
     level    REAL NOT NULL,                             -- 名义潮位（米）
     error    REAL NOT NULL DEFAULT 0.0,                 -- 预测误差（米，非负）：真值落在 level±error
+    PRIMARY KEY (revision, minute)
+);
+
+-- 修订增量：每个（非基）修订每个被本次改动的分钟一行，存该分钟在**本修订
+-- 解析后**的完整 (level, error)。未改分钟不写行——查询时沿 base_revision
+-- 祖先链继承最近一次对该分钟的解析值；链上始终无该分钟即缺名义潮位
+-- （规划/复核沿用 MISSING_TIDE_DATA）。名义更正：所列分钟的误差继承基础
+-- 修订（基础修订没有该分钟时为 0）；误差修订：名义潮位继承基础修订，
+-- 且只允许提交基础修订已有名义潮位的分钟（不能凭空新增）。
+CREATE TABLE IF NOT EXISTS tide_deltas (
+    revision INTEGER NOT NULL REFERENCES tide_revisions(revision),
+    minute   INTEGER NOT NULL,
+    level    REAL NOT NULL,                             -- 本修订该分钟解析后的名义潮位（米）
+    error    REAL NOT NULL DEFAULT 0.0,                 -- 本修订该分钟解析后的预测误差（米，非负）
     PRIMARY KEY (revision, minute)
 );
 
@@ -239,27 +259,73 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """旧版数据库平滑升级：为 tide_values 补 error 列（既有行误差取 0）；
-    为 confirmed_trips 补 ship_no / ship_version 档案引用列（既有行程为 NULL，
-    表示直接提交参数确认、无档案引用）与 berth_id / work_minutes /
-    work_start_minute / work_end_minute 泊位作业快照列（既有行程为 NULL，
-    表示未指定泊位的旧确认，其请求与响应保持原样）。"""
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(tide_values)").fetchall()}
-    if "error" not in cols:
-        conn.execute("ALTER TABLE tide_values ADD COLUMN error REAL NOT NULL DEFAULT 0.0")
-    trip_cols = {r["name"] for r in conn.execute("PRAGMA table_info(confirmed_trips)").fetchall()}
-    if "ship_no" not in trip_cols:
-        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN ship_no TEXT")
-    if "ship_version" not in trip_cols:
-        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN ship_version INTEGER")
-    if "berth_id" not in trip_cols:
-        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN berth_id TEXT")
-    if "work_minutes" not in trip_cols:
-        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN work_minutes INTEGER")
-    if "work_start_minute" not in trip_cols:
-        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN work_start_minute INTEGER")
-    if "work_end_minute" not in trip_cols:
-        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN work_end_minute INTEGER")
+    """旧版数据库平滑升级（全部步骤幂等，且包在单个 BEGIN IMMEDIATE 事务中：
+    升级中断重启后整体重做，提交前任何崩溃都不留半迁移状态）。
+
+    1. 为 tide_values 补 error 列（既有行误差取 0）；
+    2. 为 tide_revisions 补 base_revision / kind 列——既有全量修订作为**基
+       修订**保留（base_revision=NULL、kind='root'），修订号、历史分钟值与
+       引用它们的已确认行程快照均原样可用；
+    3. 为 confirmed_trips 补 ship_no / ship_version 档案引用列（既有行程为
+       NULL）与 berth_id / work_minutes / work_start_minute / work_end_minute
+       泊位作业快照列（既有行程为 NULL）。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(tide_values)").fetchall()}
+        if "error" not in cols:
+            conn.execute(
+                "ALTER TABLE tide_values ADD COLUMN error REAL NOT NULL DEFAULT 0.0"
+            )
+
+        rev_cols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(tide_revisions)").fetchall()}
+        if "base_revision" not in rev_cols:
+            conn.execute(
+                "ALTER TABLE tide_revisions ADD COLUMN base_revision INTEGER"
+                " REFERENCES tide_revisions(revision)"
+            )
+        if "kind" not in rev_cols:
+            conn.execute("ALTER TABLE tide_revisions ADD COLUMN kind TEXT")
+        # 既有全量修订（含本轮之前产生、未带 kind 的修订）一律标记为基修订；
+        # 新代码生成的更正/误差修订在插入时即带 kind，不会被此语句触碰。
+        conn.execute(
+            "UPDATE tide_revisions SET kind = 'root' WHERE kind IS NULL"
+        )
+
+        # 幂等兜底：正常路径已由 SCHEMA 建表，此处保证旧库升级同样存在
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS tide_deltas ("
+            " revision INTEGER NOT NULL REFERENCES tide_revisions(revision),"
+            " minute   INTEGER NOT NULL,"
+            " level    REAL NOT NULL,"
+            " error    REAL NOT NULL DEFAULT 0.0,"
+            " PRIMARY KEY (revision, minute))"
+        )
+
+        trip_cols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(confirmed_trips)").fetchall()}
+        if "ship_no" not in trip_cols:
+            conn.execute("ALTER TABLE confirmed_trips ADD COLUMN ship_no TEXT")
+        if "ship_version" not in trip_cols:
+            conn.execute("ALTER TABLE confirmed_trips ADD COLUMN ship_version INTEGER")
+        if "berth_id" not in trip_cols:
+            conn.execute("ALTER TABLE confirmed_trips ADD COLUMN berth_id TEXT")
+        if "work_minutes" not in trip_cols:
+            conn.execute("ALTER TABLE confirmed_trips ADD COLUMN work_minutes INTEGER")
+        if "work_start_minute" not in trip_cols:
+            conn.execute(
+                "ALTER TABLE confirmed_trips ADD COLUMN work_start_minute INTEGER"
+            )
+        if "work_end_minute" not in trip_cols:
+            conn.execute(
+                "ALTER TABLE confirmed_trips ADD COLUMN work_end_minute INTEGER"
+            )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +360,7 @@ def _seed_demo(conn: sqlite3.Connection) -> None:
         )
 
         rev = conn.execute(
-            "INSERT INTO tide_revisions(note) VALUES (?)",
+            "INSERT INTO tide_revisions(note, base_revision, kind) VALUES (?, NULL, 'root')",
             ("初始潮位修订：周期 720 分钟正弦潮，振幅 1.5m，均值 2.0m",),
         ).lastrowid
 

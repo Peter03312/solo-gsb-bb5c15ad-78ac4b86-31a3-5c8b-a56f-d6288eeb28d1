@@ -163,6 +163,14 @@ class RevisionOut(BaseModel):
     revision: int
     note: Optional[str] = None
     created_at: str
+    base_revision: Optional[int] = Field(
+        default=None,
+        description="本修订的基础修订号（允许从非最新修订分叉）；空表示基修订（全量）"
+    )
+    kind: Optional[str] = Field(
+        default=None,
+        description="修订类型：root=基修订（全量）/ correction=名义潮位更正 / error=预测误差修订"
+    )
 
 
 # ---- 规划 / 确认 ----------------------------------------------------------------

@@ -70,13 +70,13 @@ def _load_segments(conn) -> dict[int, Segment]:
 
 
 def _load_tide(conn, revision: int, lo: int, hi: int) -> dict[int, tuple[float, float]]:
-    """返回修订 revision 在 [lo, hi] 闭区间内的 {minute: (level, error)}。"""
-    rows = conn.execute(
-        "SELECT minute, level, error FROM tide_values"
-        " WHERE revision = ? AND minute BETWEEN ? AND ?",
-        (revision, lo, hi),
-    ).fetchall()
-    return {r["minute"]: (r["level"], r["error"]) for r in rows}
+    """返回修订 revision 在 [lo, hi] 闭区间内的完整 {minute: (level, error)}。
+
+    更正/误差修订为增量存储，数据沿 base_revision 祖先链还原（未改分钟继承
+    基础修订），见 services/tides.py。
+    """
+    from .tides import load_tide
+    return load_tide(conn, revision, lo, hi)
 
 
 def _minute_ok(seg: Segment, tide: float, error: float,

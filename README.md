@@ -9,12 +9,25 @@
 既有已确认快照即使彼此重叠也原样保留、作为后续规划必须避开的占用。潮位以**修订号**
 版本化管理，分两类：
 
-- **名义潮位更正**（`POST /api/tide/corrections`）：以某修订为基础全量继承名义潮位
-  **与误差**，仅覆盖给定分钟的名义潮位（被覆盖分钟的误差仍继承，新分钟误差为 0），
+- **名义潮位更正**（`POST /api/tide/corrections`）：以**任一已存在修订**为
+  基础（允许从**非最新**修订分叉），未改分钟沿修订链继承；仅覆盖所列分钟的
+  名义潮位（被覆盖分钟的误差沿用基础修订，基础修订没有的新分钟误差为 0），
   生成新修订；
-- **预测误差修订**（`POST /api/tide/error-revisions`）：潮位预测存在**逐分钟误差**，
-  调度员按「非负整分钟 → 非负误差（米）」提交更改；**名义潮位保持不变**，未列出分钟
-  继承基础修订误差；旧修订一律视为误差 **0**。
+- **预测误差修订**（`POST /api/tide/error-revisions`）：调度员按「非负整分钟
+  → 非负误差（米）」提交更改；**名义潮位保持不变**，未列出分钟继承基础修订
+  误差，且只能修改基础修订（沿链）**已有名义潮位**的分钟；旧修订一律视为
+  误差 **0**。
+
+**本轮重构为增量修订存储**：更正/误差修订不再把基础修订的全部分钟复制一份，
+只把**本次改动分钟**解析后的（名义潮位、误差）写入增量表 `tide_deltas`
+（每行一分钟），并以 `base_revision` 指向基础修订——每次修订的持久化写入量只随
+**本次改动分钟数**增长，与基础修订的分钟规模无关。任意历史修订的分钟范围查询
+经 `base_revision` 祖先链还原**完整名义潮位与误差**（未改分钟取链上最近修订的
+值；链上始终无该分钟即缺名义潮位，沿用 `MISSING_TIDE_DATA`）。规划、确认、批次、
+复核与改期确认读取同一修订号时走同一还原函数，数据一致；并发修订仍由
+`BEGIN IMMEDIATE` 串行生效。旧库升级在单个事务内补列建表，**修订号、历史分钟值
+与已确认行程快照全部保持可用**，升级中断重启不会留下半迁移状态。HTTP 接口的
+请求、响应与状态码保持兼容（修订列表/详情仅新增可空字段 `base_revision`/`kind`）。
 
 修订号自增、内容**不可变**。核验水深/净空时按修订的**误差带取保守极值**：
 
@@ -277,18 +290,34 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
   序列**做字典序比较，序列小者优先（先比较首段编号，相同再比较下一段）；节点等待
   不产生航段编号、不计入序列。正航时回路可能使长度不同的序列在同一 `(节点, 分钟)`
   会合，规划不再因此剪掉较长前缀（三遍 DP，见算法说明）。
-- **潮位修订**：修订号自增、内容不可变，分两种提交方式（均可省略 `base_revision`
-  而默认基于**最新**修订；未知基础修订报 `TIDE_REVISION_NOT_FOUND`）：
-  - **名义潮位更正** `/api/tide/corrections`：全量继承基础修订的名义潮位与误差，
-    仅覆盖给定分钟的名义潮位（被覆盖分钟**继承误差**；基础修订没有的分钟作为新
-    分钟补入、误差取 0）；
+- **潮位修订（增量存储 + 修订链还原）**：修订号自增、内容不可变，分两种
+  提交方式（均可省略 `base_revision` 而默认基于**最新**修订；也允许显式指定
+  **任意已存在（含非最新）修订分叉**；未知基础修订报
+  `TIDE_REVISION_NOT_FOUND`）：
+  - **名义潮位更正** `/api/tide/corrections`：**只为所列分钟写增量行**，覆盖
+    名义潮位（被覆盖分钟的误差**沿用基础修订**；基础修订没有的分钟作为新
+    分钟补入、误差取 0）；未列出分钟沿 `base_revision` 链继承，不产生写入；
   - **预测误差修订** `/api/tide/error-revisions`：载荷为 `{分钟: 非负误差}`，
-    **名义潮位不变**；未列出分钟**继承**基础修订的误差，列出分钟覆盖为给定误差；
-    误差必须非负（否则 `422 VALIDATION_ERROR`）；所提交分钟在基础修订中必须已有
-    名义潮位，否则 `422 MISSING_TIDE_DATA`（误差修订不能凭空新增名义潮位）。
-  - **旧修订视为误差 0**：早于误差功能的修订（含旧版数据库升级后的既有行）均无
-    误差数据，按误差 0 处理；规划/复核目标窗口内任一分钟缺**名义潮位**即报
-    `MISSING_TIDE_DATA`。
+    **名义潮位不变**；同样只写所列分钟的增量行；未列出分钟继承基础修订误差，
+    列出分钟覆盖为给定误差；误差必须非负（否则 `422 VALIDATION_ERROR`）；
+    所提交分钟在基础修订（沿链）必须已有名义潮位，否则
+    `422 MISSING_TIDE_DATA`（误差修订不能凭空新增名义潮位，分叉时只沿所指定
+    基础修订的祖先链判断）。
+  - **写入量**：每次修订仅向 `tide_deltas` 写入**本次改动分钟数**的行，不再
+    复制基础修订（基修订全量数据在 `tide_values` 中一份不变）；即使基础修订
+    覆盖 1440 分钟、本次只改 1 分钟，也只写 1 行。
+  - **读取还原**：`GET /api/tide/revisions/{rev}?from_minute=&to_minute=` 对
+    任意历史修订（含分叉）沿 `base_revision` 祖先链取每个分钟最近一次改动的
+    解析值，返回完整名义潮位 `levels` 与误差 `errors`；规划/确认/批次/复核/
+    改期确认按同一修订号经同一还原函数读取，口径一致。链上始终无某分钟即
+    缺**名义潮位**，规划/复核报 `MISSING_TIDE_DATA`。
+  - **旧修订视为误差 0**：早于误差功能的修订（含旧版数据库升级后的既有
+    全量行，标记为 `kind='root'`、`base_revision` 为空）误差按 0 处理。
+  - **旧库升级**：启动时在**单个 `BEGIN IMMEDIATE` 事务**内为
+    `tide_revisions` 补 `base_revision`/`kind` 列、建立 `tide_deltas` 表、
+    为 `tide_values` 补 `error` 列（另含历次已加列迁移）；全部步骤幂等，
+    中断重启后整体重做，提交前崩溃不留半迁移状态。既有修订号、历史分钟值
+    与已确认行程快照（含批次幂等记录）原样可用。
 - **规划**：默认使用**最新**修订，也可显式指定修订号。窗口内任何一分钟缺少名义
   潮位即报错。水深/净空均按所据修订的误差带保守极值核验，且每个出发区间都不得与
   既有已确认快照的航段占用重叠（重叠即视为该进入分钟不可行，等价于低潮/净空不足）。
@@ -637,6 +666,22 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ## 3. HTTP API
 
+> **本轮用法（潮位修订增量存储 + 任意修订分叉）**：现有 4 个潮位接口的路径、
+> 请求体与状态码完全不变，`GET /api/tide/revisions` 与更正/误差修订响应新增
+> 可空字段 `base_revision`、`kind`（旧客户端可忽略）——
+> - 每次更正/误差修订只持久化**本次改动分钟**（写入量随改动分钟数线性增长，
+>   不再复制基础修订全量）；分钟范围查询对**任意历史修订**（含分叉）沿
+>   `base_revision` 祖先链还原**完整名义潮位与误差**；
+> - `base_revision` 允许指定**非最新**修订分叉；名义更正只覆盖所列分钟的潮位
+>   （已有分钟误差沿用基础修订、新分钟误差 0），误差修订只能改基础修订链上
+>   已有的分钟（否则 `422 MISSING_TIDE_DATA`），未知修订沿用
+>   `404 TIDE_REVISION_NOT_FOUND`，缺失分钟沿用 `422 MISSING_TIDE_DATA`；
+> - 规划、确认、批次、复核与改期确认按同一修订号读同一还原结果，并发修订仍经
+>   `BEGIN IMMEDIATE` 串行生效；旧库单事务原子升级，修订号、历史值与已确认
+>   快照保持可用，启动方式（`docker compose up` / `docker run` /
+>   `uvicorn app.main:app`）不变。示例见
+>   [增量修订与分叉：本轮调用示例](#增量修订与分叉本轮调用示例)。
+>
 > **本轮用法（不安全航次改期确认）**：新增 1 个写接口
 > `POST /api/trips/{trip_id}/reschedule`；既有全部接口路径、请求/响应契约
 > 不变（只读复核 `/review` 仅内部函数拆分、行为完全一致）——
@@ -829,10 +874,10 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | PUT | `/api/ships/{ship_no}` | **本轮新增**：变更档案（有效变更递增版本，无实际变化不递增） |
 | GET | `/api/ships/{ship_no}/versions` | **本轮新增**：全部历史版本（按版本号升序） |
 | GET | `/api/ships/{ship_no}/versions/{version}` | **本轮新增**：指定历史版本 |
-| GET | `/api/tide/revisions` | 潮位修订列表 |
-| GET | `/api/tide/revisions/{rev}?from_minute=&to_minute=` | 取某修订逐分钟名义潮位 `levels` 与预测误差 `errors` |
-| POST | `/api/tide/corrections` | 名义潮位更正（继承误差），生成新修订 |
-| POST | `/api/tide/error-revisions` | 预测误差修订（名义潮位不变），生成新修订 |
+| GET | `/api/tide/revisions` | 潮位修订列表（新增可空字段 `base_revision`/`kind`） |
+| GET | `/api/tide/revisions/{rev}?from_minute=&to_minute=` | 取某修订逐分钟**还原后**的完整名义潮位 `levels` 与预测误差 `errors`（沿修订链继承） |
+| POST | `/api/tide/corrections` | 名义潮位更正（增量写入，仅所列分钟；误差继承，新分钟为 0；可从非最新修订分叉），生成新修订 |
+| POST | `/api/tide/error-revisions` | 预测误差修订（增量写入，仅所列分钟；名义潮位不变），生成新修订 |
 | POST | `/api/trips/plan` | 规划最早抵达行程；**本轮扩展**：可携 `berth_id`+`work_minutes` 指定终点泊位（抵达即开工，作业区间完整落在同一开放区间且不与有效泊位占用重叠） |
 | POST | `/api/trips/confirm` | 携带修订号确认行程（事务复核）；指定泊位时按当时日历/占用复算并固化泊位作业区间 |
 | POST | `/api/trips/batch/plan` | **本轮扩展泊位**：同修订 2～5 艘船按优先顺序批次预排（只读不占位，后船避前船航段与泊位拟占用） |
@@ -847,6 +892,73 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/trips` | 已确认行程列表（含已作废历史快照，`voided_at` 标识是否已作废） |
 | GET | `/api/trips/{trip_id}` | 已确认行程快照详情 |
 | GET | `/health` | 健康检查 |
+
+### 增量修订与分叉：本轮调用示例
+
+更正/误差修订**只持久化本次改动的分钟**（`tide_deltas` 每行一分钟），分钟范围
+查询沿 `base_revision` 祖先链还原完整名义潮位与误差；允许从非最新修订分叉。
+以下示例基于演示库（修订 `#1` 含分钟 `0..1439`、误差 0）：
+
+```bash
+BASE=http://localhost:8000
+
+# 1) 名义潮位更正：只改 100/101 两个分钟（无论基础修订有多少分钟，只写 2 行）
+curl -s -X POST $BASE/api/tide/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{"corrections":{"100":2.5,"101":2.25},"note":"更正 100/101"}'
+# {"revision":2,"note":"更正 100/101","created_at":"...",
+#  "base_revision":1,"kind":"correction"}
+
+# 2) 在 #2 上做误差修订：只改第 100 分钟误差（名义潮位不变；只写 1 行）
+curl -s -X POST $BASE/api/tide/error-revisions \
+  -H 'Content-Type: application/json' \
+  -d '{"errors":{"100":0.3}}'
+# {"revision":3,...,"base_revision":2,"kind":"error"}
+
+# 3) 范围查询任意历史修订：#3 在 99..102 的完整名义潮位与误差
+#    100=更正后名义 2.5 + 误差 0.3；101=更正后名义 2.25、误差继承 0；
+#    99/102 未在任何增量中出现，沿链继承 #1 的名义与误差 0
+curl -s "$BASE/api/tide/revisions/3?from_minute=99&to_minute=102"
+# {"revision":3,"from_minute":99,"to_minute":102,"count":4,
+#  "levels":{"99":3.1406...,"100":2.5,"101":2.25,"102":3.1657...},
+#  "errors":{"99":0.0,"100":0.3,"101":0.0,"102":0.0}}
+
+# 4) 从非最新修订 #1 分叉：#2/#3 的改动对该分支不可见
+curl -s -X POST $BASE/api/tide/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{"corrections":{"200":1.25},"base_revision":1,"note":"从 #1 分叉"}'
+# {"revision":4,...,"base_revision":1,"kind":"correction"}
+curl -s "$BASE/api/tide/revisions/4?from_minute=100&to_minute=100"
+# 第 100 分钟仍为 #1 的正弦名义、误差 0（#2/#3 不可见）
+# {"levels":{"100":3.1490...},"errors":{"100":0.0},...}
+
+# 5) 误差修订只能改基础修订链上已有名义潮位的分钟；#4 链上没有第 2000 分钟
+curl -s -X POST $BASE/api/tide/error-revisions \
+  -H 'Content-Type: application/json' \
+  -d '{"errors":{"2000":0.1},"base_revision":4}'
+# HTTP 422 {"error":{"code":"MISSING_TIDE_DATA",
+#   "details":{"missing_minutes":[2000],"total_missing":1,"base_revision":4},...}}
+
+# 6) 规划 / 确认 / 批次 / 复核携带（可能是分叉的）修订号时，读取的均为该修订
+#    沿链还原后的同一名义潮位与误差；确认仍要求该修订为最新，否则 REVISION_STALE
+curl -s -X POST $BASE/api/trips/plan -H 'Content-Type: application/json' -d '{
+  "origin":"A","destination":"B","start_minute":0,"window_minutes":1440,
+  "draft":3.0,"height":0.0,"margin":0.2,"revision":3}'
+```
+
+持久化写入量核对（每次修订的增量行数 = 本次改动分钟数；全量数据只属于基修订）：
+
+```bash
+sqlite3 /data/tide.db \
+  "SELECT revision, COUNT(*) FROM tide_deltas GROUP BY revision;"
+# 2|2   （#2 改 2 分钟）
+# 3|1   （#3 改 1 分钟）
+# 4|1   （#4 分叉改 1 分钟）
+```
+
+修订列表对每个修订回传 `kind`（`root`/`correction`/`error`）与
+`base_revision`（基修订为 `null`）；这两个字段为新增可空字段，旧响应的
+`revision`/`note`/`created_at` 不变。
 
 ### 预测误差修订请求 / 响应示例
 
